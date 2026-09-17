@@ -19,7 +19,7 @@ Unofficial companion tooling. Not affiliated with or endorsed by the Handy proje
 ## 1. Install
 
 ```bash
-git clone <this repo> && cd handy-deck
+git clone https://github.com/codedre/handy-deck.git && cd handy-deck
 zsh install.sh
 ```
 
@@ -75,7 +75,7 @@ Optional variants:
 
 The feedback overrides only the Background color, so every dictation key turns the same red while recording.
 
-Reference layout (Command Center page):
+Reference layout (example page):
 
 | | Col 0 | Col 1 | Col 2 |
 |---|---|---|---|
@@ -162,3 +162,7 @@ icons/companion/         transparent glyphs for Companion layered styles (+ full
 icons/streamdeck/        baked idle/rec PNGs for the native Stream Deck app
 icons/preview.png
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
