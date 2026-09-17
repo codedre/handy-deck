@@ -1,0 +1,247 @@
+#!/bin/zsh
+# handy-ctl: deterministic Stream Deck / Companion control for Handy (macOS)
+#
+# Talks to the running Handy instance with Unix signals (instant, no second
+# process): SIGUSR2 = transcribe, SIGUSR1 = transcribe + post-process.
+# Tracks record state locally and pushes it to a Companion custom variable
+# so buttons can light up.
+
+emulate -L zsh
+setopt no_unset
+zmodload zsh/datetime
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+CONF_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/handy-deck/config"
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+
+: ${HANDY_APP:=/Applications/Handy.app}
+: ${COMPANION_URL=http://127.0.0.1:8000}   # set empty to disable state push
+: ${COMPANION_VAR:=handy_state}
+: ${MIN_HOLD_MS:=250}                       # PTT taps shorter than this cancel
+: ${RACE_WINDOW_MS:=120}                    # release this close to a press = same tap
+: ${LOCK_TIMEOUT_MS:=1500}
+: ${HANDY_DECK_STATE_DIR:=$HOME/Library/Application Support/handy-deck}
+
+# Resolve the real executable name from the bundle. Handy ships a lowercase
+# "handy" binary; macOS paths are case-insensitive but process names are not.
+HANDY_EXEC=""
+if [[ -r "$HANDY_APP/Contents/Info.plist" && -x /usr/libexec/PlistBuddy ]]; then
+  HANDY_EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$HANDY_APP/Contents/Info.plist" 2>/dev/null)"
+fi
+: ${HANDY_EXEC:=handy}
+HANDY_BIN="$HANDY_APP/Contents/MacOS/$HANDY_EXEC"
+STATE_DIR="$HANDY_DECK_STATE_DIR"
+STATE_FILE="$STATE_DIR/state"
+DOWN_AT_FILE="$STATE_DIR/down_at"
+UP_AT_FILE="$STATE_DIR/up_at"
+LOCK_DIR="$STATE_DIR/lock"
+LOG_FILE="$STATE_DIR/handy-ctl.log"
+HPID=""
+
+mkdir -p "$STATE_DIR"
+
+# ---------- helpers ----------
+now_ms() { local -i ms; (( ms = EPOCHREALTIME * 1000 )); print -r -- $ms }
+
+log() {
+  if [[ -f "$LOG_FILE" ]] && (( $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE") > 1048576 )); then
+    mv -f "$LOG_FILE" "$LOG_FILE.1"
+  fi
+  print -r -- "$(strftime '%F %T' $EPOCHSECONDS) [$CMD] $*" >> "$LOG_FILE"
+}
+
+read_file() { # $1 file, $2 default
+  local v=""
+  [[ -r "$1" ]] && read -r v < "$1"
+  print -r -- "${v:-$2}"
+}
+
+get_state() { read_file "$STATE_FILE" idle }
+
+push_state() {
+  [[ -z "$COMPANION_URL" ]] && return 0
+  # Fully detached so Companion's exec never waits on curl.
+  curl -s -o /dev/null -m 1 -X POST \
+    "$COMPANION_URL/api/custom-variable/$COMPANION_VAR/value?value=$1" \
+    </dev/null >/dev/null 2>&1 &!
+}
+
+set_state() {
+  print -r -- "$1" > "$STATE_FILE.tmp" && mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+  push_state "$1"
+  log "state -> $1"
+}
+
+handy_pid() {
+  # Match on process name (case-insensitive), not full argv, so shells whose
+  # command line merely mentions the Handy path never get signalled.
+  local pid comm
+  for pid in $(pgrep -i -x "$HANDY_EXEC" 2>/dev/null); do
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null)"
+    if [[ "${comm:l}" == "${HANDY_BIN:l}" ]]; then
+      print -r -- "$pid"; return 0
+    fi
+  done
+  pgrep -o -i -x "$HANDY_EXEC" 2>/dev/null | head -n1
+}
+
+ensure_running() {
+  HPID="$(handy_pid)"
+  [[ -n "$HPID" ]] && return 0
+  if [[ ! -x "$HANDY_BIN" ]]; then
+    log "Handy binary not found: $HANDY_BIN"
+    print -u2 "handy-ctl: Handy not found at $HANDY_APP (set HANDY_APP in $CONF_FILE)"
+    return 2
+  fi
+  open -g -a "$HANDY_APP" --args --start-hidden
+  log "No process named '$HANDY_EXEC' found; launching $HANDY_APP hidden."
+  set_state idle
+  return 3
+}
+
+send_sig() { # USR2 | USR1
+  if kill -"$1" "$HPID" 2>/dev/null; then
+    log "SIG$1 -> pid $HPID"
+  else
+    log "SIG$1 -> pid $HPID FAILED"
+    return 1
+  fi
+}
+
+start_rec() { # plain | ai
+  if [[ "$1" == ai ]]; then send_sig USR1 && set_state ai
+  else send_sig USR2 && set_state rec; fi
+}
+
+stop_rec() { # stop with the same binding that started it
+  case "$(get_state)" in
+    rec) send_sig USR2 ;;
+    ai)  send_sig USR1 ;;
+  esac
+  set_state idle
+}
+
+do_cancel() {
+  "$HANDY_BIN" --cancel </dev/null >/dev/null 2>&1 &!
+  rm -f "$DOWN_AT_FILE"
+  set_state idle
+}
+
+# ---------- commands ----------
+cmd_toggle() { # plain | ai
+  case "$(get_state)" in
+    rec|ai) stop_rec ;;
+    *)      start_rec "$1" ;;
+  esac
+}
+
+cmd_ptt_down() { # plain | ai
+  local up_at; up_at="$(read_file "$UP_AT_FILE" 0)"
+  rm -f "$UP_AT_FILE"
+  # Press and release run as separate processes and can land out of order.
+  # A release stamped within RACE_WINDOW_MS of this press belongs to it.
+  if (( up_at > 0 && up_at >= T0 - RACE_WINDOW_MS )); then
+    log "release ($(( up_at - T0 ))ms) raced ahead of press; treating as tap, not starting"
+    return 0
+  fi
+  local st; st="$(get_state)"
+  if [[ "$st" != idle ]]; then
+    log "press ignored, state=$st"
+    return 0
+  fi
+  print -r -- "$T0" > "$DOWN_AT_FILE"
+  start_rec "$1"
+}
+
+cmd_ptt_up() {
+  local st; st="$(get_state)"
+  if [[ "$st" == idle ]]; then
+    # Press hasn't been processed yet (or never started). Leave a marker.
+    print -r -- "$T0" > "$UP_AT_FILE"
+    return 0
+  fi
+  local down_at held
+  down_at="$(read_file "$DOWN_AT_FILE" 0)"
+  rm -f "$DOWN_AT_FILE"
+  (( held = T0 - down_at ))
+  if (( held < MIN_HOLD_MS )); then
+    log "held ${held}ms < ${MIN_HOLD_MS}ms -> cancel"
+    do_cancel
+    return 0
+  fi
+  stop_rec
+}
+
+cmd_doctor() {
+  local ok=0
+  print "handy-ctl doctor"
+  print "  config:      $CONF_FILE $([[ -f $CONF_FILE ]] && print '(found)' || print '(defaults)')"
+  if [[ -x "$HANDY_BIN" ]]; then print "  handy app:   OK  $HANDY_APP (executable: $HANDY_EXEC)"
+  else print "  handy app:   FAIL  $HANDY_BIN not executable"; ok=1; fi
+  local pid; pid="$(handy_pid)"
+  if [[ -n "$pid" ]]; then print "  handy proc:  OK  pid $pid"
+  else print "  handy proc:  WARN not running (buttons will launch it)"; fi
+  print "  state:       $(get_state)"
+  if [[ -z "$COMPANION_URL" ]]; then
+    print "  companion:   disabled"
+  else
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 2 "$COMPANION_URL/api/custom-variable/$COMPANION_VAR/value")"
+    case "$code" in
+      200) print "  companion:   OK  \$(custom:$COMPANION_VAR) reachable at $COMPANION_URL" ;;
+      404) print "  companion:   WARN reachable, but custom variable '$COMPANION_VAR' missing. Create it in Companion > Variables."; ok=1 ;;
+      000) print "  companion:   WARN not reachable at $COMPANION_URL (not running, wrong port, or HTTP API off)" ;;
+      *)   print "  companion:   WARN HTTP $code from $COMPANION_URL"; ok=1 ;;
+    esac
+  fi
+  print "  log:         $LOG_FILE"
+  return $ok
+}
+
+usage() {
+  cat <<'EOF'
+handy-ctl <command>
+
+  toggle            tap to start / tap to stop (plain transcription)
+  ai                tap to start / tap to stop (with post-processing)
+  ptt-down [ai]     push-to-talk press  (Companion: on press)
+  ptt-up            push-to-talk release (Companion: on release)
+  cancel            discard the current take, state -> idle
+  reset             resync state to idle without touching Handy
+  status            print state and Handy pid
+  doctor            check install, Handy, and Companion wiring
+EOF
+}
+
+# ---------- main ----------
+T0="$(now_ms)"
+CMD="${1:-help}"
+
+case "$CMD" in
+  help|-h|--help) usage; exit 0 ;;
+  status) print -r -- "state=$(get_state) pid=$(handy_pid)"; exit 0 ;;
+  doctor) cmd_doctor; exit $? ;;
+esac
+
+# Serialize everything that mutates state (PTT press/release can overlap).
+typeset -i deadline
+(( deadline = T0 + LOCK_TIMEOUT_MS ))
+until mkdir "$LOCK_DIR" 2>/dev/null; do
+  if (( $(now_ms) > deadline )); then
+    log "stale lock cleared"
+    rm -rf "$LOCK_DIR"
+  fi
+  sleep 0.02
+done
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+trap 'exit 130' INT TERM
+
+case "$CMD" in
+  reset)    set_state idle ;;
+  toggle)   ensure_running || exit $?; cmd_toggle plain ;;
+  ai)       ensure_running || exit $?; cmd_toggle ai ;;
+  ptt-down) ensure_running || exit $?; cmd_ptt_down "${2:-plain}" ;;
+  ptt-up)   ensure_running || exit $?; cmd_ptt_up ;;
+  cancel)   ensure_running || exit $?; do_cancel ;;
+  *)        usage >&2; exit 64 ;;
+esac
